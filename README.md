@@ -3,9 +3,12 @@
 Microservicio de **notificaciones** del caso VidaSalud · DSY1107 Desarrollo Cloud
 Native I.
 
-Avisa al paciente cuando su atención se confirma o se cancela. Es un servicio
-consumidor: no tiene endpoints de escritura y nadie le pide que envíe un aviso. Escucha
-la cola `q.notificaciones.email` y actúa.
+Avisa al paciente cuando su atención se confirma o se cancela.
+
+Este servicio **no habla AMQP**: su `pom.xml` no incluye el starter de RabbitMQ y no
+contiene ninguna clase de mensajería. El envío lo dispara `ms-vidasalud-rabbit-admin`,
+que consume la cola `q.notificaciones.email` y llama por HTTP a este servicio. Aquí solo
+vive la redacción y el envío del aviso.
 
 ## Por qué es un servicio aparte
 
@@ -22,47 +25,45 @@ que confirma la atención ni sabe que existe.
 
 ```
 appointments confirma la atención
-        │
-        └─ publica "atencion.confirmada" en vidasalud.atenciones.topic
+        │  (HTTP)
+        └─→ ms-vidasalud-rabbit-admin publica "atencion.confirmada"
                  │
-                 ├─→ q.admision.ticket        (lo consume appointments)
-                 └─→ q.notificaciones.email   (lo consume este servicio)
+                 ├─→ q.admision.ticket        → PUT  {appointments}/.../ticket
+                 └─→ q.notificaciones.email   → POST {notifications}/api/notifications
 ```
 
 La cola está ligada al exchange **topic** con dos routing keys,
 `atencion.confirmada` y `atencion.cancelada`. Las dos generan un correo, con texto
-distinto, y el productor no tuvo que saberlo: eso es lo que permite un topic frente a un
-direct.
+distinto, y el productor no tuvo que saberlo.
 
 ## Endpoints
 
-| Método | Ruta | Descripción |
+| Método | Ruta | Quién llama |
 |---|---|---|
-| `GET` | `/api/notifications` | Avisos enviados, del más reciente al más antiguo |
+| `GET` | `/api/notifications` | El personal, a través del BFF |
+| `POST` | `/api/notifications` | ms-vidasalud-rabbit-admin, al consumir la cola |
 
-Solo lectura a propósito: los avisos los crea el consumidor de la cola, no una petición
-HTTP. Existe para poder demostrar la mensajería: se confirma una atención desde el
-frontend y el aviso aparece aquí sin que nadie haya llamado a este servicio.
+El `GET` existe para poder demostrar la mensajería: se confirma una atención desde el
+frontend y el aviso aparece aquí sin que ningún usuario haya llamado a este servicio. En
+el BFF está permitido a **ADMIN** y **RECEPCIONISTA**; un paciente no tiene por qué ver
+los avisos enviados a otros.
 
-En el BFF, esta ruta está permitida a **ADMIN** y **RECEPCIONISTA**. Un paciente no tiene
-por qué ver los avisos enviados a otros.
+El `POST` es interno y lo dispara el consumidor de la cola. Responde **400** cuando el
+mensaje no trae correo o trae un estado que no genera aviso: el consumidor interpreta ese
+4xx como error definitivo y manda el mensaje a la DLQ en vez de reintentarlo.
 
 ## Manejo de errores
 
-ACK manual. El consumidor decide explícitamente qué hacer con cada mensaje:
+El ACK manual vive en el servicio de mensajería, que es quien consume la cola. Lo que
+aporta este servicio es la **distinción entre errores**, con los códigos HTTP que
+devuelve:
 
-| Situación | Decisión |
-|---|---|
-| Aviso enviado | `basicAck` |
-| Mensaje sin correo del paciente | `basicNack` sin requeue → DLQ |
-| Estado que no genera aviso | `basicNack` sin requeue → DLQ |
-| Servidor de correo caído, 1ª vez | `basicNack` con requeue → se reintenta |
-| Servidor de correo caído, 2ª vez | `basicNack` sin requeue → DLQ |
-
-El límite de un reintento es deliberado: un mensaje que falla dos veces no se arregla
-insistiendo, y dejarlo girando en la cola bloquea a los demás. Lo que llega a
-`q.notificaciones.email.dlq` se registra con nivel `error`: un paciente que no recibió su
-aviso es un problema de atención al cliente, no un dato desechable.
+| Situación | Respuesta | Qué hace el consumidor |
+|---|---|---|
+| Aviso enviado | `201` | `basicAck` |
+| Sin correo del paciente | `400` | `basicNack` sin requeue → DLQ |
+| Estado que no genera aviso | `400` | `basicNack` sin requeue → DLQ |
+| Este servicio caído | sin respuesta | reintenta una vez, luego DLQ |
 
 ## El envío es simulado
 
@@ -77,17 +78,13 @@ cambiar una clase; el resto del sistema no se entera.
 
 | Variable | Por defecto | Para qué |
 |---|---|---|
-| `RABBIT_ADDRESSES` | — | `rabbit1:5672,rabbit2:5672`, las dos del clúster |
-| `RABBIT_USER` / `RABBIT_PASS` | `admin` / `admin` | Credenciales del broker |
-| `INTERNAL_KEY` | `vidasalud-internal` | Clave compartida con el BFF |
+| `INTERNAL_KEY` | `vidasalud-internal` | Clave compartida con el BFF y la mensajería |
 
-Los nombres de colas, exchanges y routing keys están centralizados en el bloque
-`vidasalud.messaging` de `application.yml` y se leen con `MessagingProperties`. Ninguna
-clase escribe un nombre de cola.
+No hay ninguna variable de RabbitMQ: este servicio no se conecta al broker.
 
 ## Ejecutar
 
 ```bash
 mvn spring-boot:run        # http://localhost:8091
-mvn test                   # 11 pruebas, sin broker ni red
+mvn test                   # 6 pruebas, sin dependencias externas
 ```
